@@ -302,13 +302,14 @@ def write_book(book: epub.EpubBook, output_path: str) -> str:
 
 
 def send_to_kindle(path: str) -> bool:
-    sender = os.environ.get("SENDER_EMAIL")
-    password = os.environ.get("SMTP_PASSWORD")
-    host = os.environ.get("SMTP_HOST")
-    port = os.environ.get("SMTP_PORT")
-    kindle_email = os.environ.get("KINDLE_EMAIL")
+    sender = (os.environ.get("SENDER_EMAIL") or "").strip()
+    username = (os.environ.get("SMTP_USERNAME") or sender).strip()
+    password = (os.environ.get("SMTP_PASSWORD") or "").strip().replace(" ", "")
+    host = (os.environ.get("SMTP_HOST") or "").strip()
+    port = (os.environ.get("SMTP_PORT") or "").strip()
+    kindle_email = (os.environ.get("KINDLE_EMAIL") or "").strip()
 
-    if not all([sender, password, host, port, kindle_email]):
+    if not all([sender, username, password, host, port, kindle_email]):
         print("Missing email configuration; skipping Kindle delivery.")
         return False
 
@@ -329,9 +330,16 @@ def send_to_kindle(path: str) -> bool:
     )
 
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(host, int(port), context=context) as server:
-        server.login(sender, password)
-        server.send_message(msg)
+    try:
+        with smtplib.SMTP_SSL(host, int(port), context=context, timeout=30) as server:
+            server.login(username, password)
+            server.send_message(msg)
+    except smtplib.SMTPAuthenticationError as exc:
+        print(f"SMTP authentication failed. Check the Gmail app password and secret values: {exc}")
+        raise
+    except smtplib.SMTPException as exc:
+        print(f"SMTP error while sending Kindle document: {exc}")
+        raise
 
     print(f"Sent EPUB to Kindle: {kindle_email}")
     return True

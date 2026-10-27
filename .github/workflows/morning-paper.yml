@@ -31,6 +31,7 @@ jobs:
         env:
           SEND_EMAIL: "true"
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
