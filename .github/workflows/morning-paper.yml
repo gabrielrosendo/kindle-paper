@@ -1,0 +1,47 @@
+name: Morning Kindle Paper
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Start early to give the ebook time to generate and email before the 6:30 AM target.
+    - cron: "30 5 * * *"
+      timezone: "America/New_York"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build and send newspaper
+        env:
+          SEND_EMAIL: "true"
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          KINDLE_EMAIL: ${{ secrets.KINDLE_EMAIL }}
+        run: python build_paper.py
+
+      - name: Save EPUB for troubleshooting
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: morning-paper
+          path: "*.epub"
+          if-no-files-found: ignore
+          retention-days: 7
