@@ -4,9 +4,12 @@ import os
 import re
 import smtplib
 import ssl
+import urllib.request
 from datetime import datetime
 from email.message import EmailMessage
 from html import escape
+from mimetypes import guess_type
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -58,6 +61,49 @@ def format_published(raw_entry: dict) -> datetime | None:
     return None
 
 
+def extract_image_url(entry: dict) -> str | None:
+    candidates: list[str] = []
+
+    media_thumbnail = entry.get("media_thumbnail")
+    if isinstance(media_thumbnail, list):
+        for item in media_thumbnail:
+            if isinstance(item, dict) and item.get("url"):
+                candidates.append(item["url"])
+    elif isinstance(media_thumbnail, dict) and media_thumbnail.get("url"):
+        candidates.append(media_thumbnail["url"])
+
+    if isinstance(entry.get("media_content"), list):
+        for item in entry["media_content"]:
+            if isinstance(item, dict) and item.get("url"):
+                candidates.append(item["url"])
+
+    for link in entry.get("links", []):
+        if isinstance(link, dict):
+            link_type = str(link.get("type", "")).lower()
+            href = link.get("href") or link.get("url")
+            if href and ("image" in link_type or href.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))):
+                candidates.append(href)
+
+    content = entry.get("content") or []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                url = item.get("url") or item.get("src")
+                if url:
+                    candidates.append(url)
+
+    for html_blob in [entry.get("summary"), entry.get("description")]:
+        if html_blob:
+            matches = re.findall(r"https?://[^\s\"']+\.(?:jpg|jpeg|png|webp|gif)", html_blob, flags=re.IGNORECASE)
+            candidates.extend(matches)
+
+    for candidate in candidates:
+        lower = candidate.lower()
+        if "nytimes" in lower or lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+            return candidate
+    return candidates[0] if candidates else None
+
+
 def fetch_section_items(section_title: str, feed_urls: list[tuple[str, str]]) -> list[dict]:
     items: list[dict] = []
     for source_name, url in feed_urls:
@@ -75,6 +121,7 @@ def fetch_section_items(section_title: str, feed_urls: list[tuple[str, str]]) ->
             link = entry.get("link") or ""
             summary = clean_text(entry.get("summary") or entry.get("description") or "")
             published = format_published(entry)
+            image_url = extract_image_url(entry)
             items.append(
                 {
                     "title": title,
@@ -82,6 +129,7 @@ def fetch_section_items(section_title: str, feed_urls: list[tuple[str, str]]) ->
                     "summary": summary,
                     "source": source_name,
                     "published": published,
+                    "image_url": image_url,
                 }
             )
 
@@ -94,25 +142,117 @@ def slugify(value: str) -> str:
     return value.strip("-") or "section"
 
 
+def download_image(url: str) -> bytes | None:
+    if not url:
+        return None
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = response.read()
+        return data if data else None
+    except Exception as exc:  # pragma: no cover - image fetch is best-effort
+        print(f"Warning: unable to download image: {url} ({exc})")
+        return None
+
+
+def render_story_card(item: dict, compact: bool = False) -> str:
+    link = escape(item["link"] or "#")
+    title = escape(item["title"]) 
+    summary = escape(item["summary"]) if item.get("summary") else ""
+    source = escape(item["source"])
+    image_html = ""
+    image_ref = item.get("image_ref")
+    if image_ref:
+        image_html = f"<img src='{image_ref}' alt='{title}' />"
+
+    story_class = "story compact" if compact else "story"
+    summary_html = f"<p>{summary}</p>" if summary else ""
+    return (
+        f"<div class='{story_class}'>"
+        f"{image_html}"
+        f"<div class='story-meta'>{source}</div>"
+        f"<h3><a href='{link}'>{title}</a></h3>"
+        f"{summary_html}"
+        f"</div>"
+    )
+
+
 def build_book(sections: dict[str, list[dict]]) -> epub.EpubBook:
     today = datetime.now(EST).strftime("%A, %B %d, %Y")
-
     book = epub.EpubBook()
     book.set_identifier("morning-paper")
     book.set_title(BOOK_TITLE)
     book.set_language("en")
     book.add_author("Morning Paper")
 
-    cover = epub.EpubHtml(
-        title="Cover",
-        file_name="cover.xhtml",
-        lang="en",
+    top_stories = [item for section in sections.values() for item in section][:5]
+    for item in top_stories:
+        if item.get("image_url"):
+            data = download_image(item["image_url"])
+            if data:
+                parsed = urlparse(item["image_url"])
+                extension = os.path.splitext(parsed.path)[1].lower() or ".jpg"
+                image_name = f"images/{slugify(item['title'])}-{len([i for i in top_stories if i.get('image_ref')])}{extension}"
+                image_item = epub.EpubImage()
+                image_item.file_name = image_name
+                image_item.content = data
+                image_item.media_type = guess_type(image_name)[0] or "image/jpeg"
+                book.add_item(image_item)
+                item["image_ref"] = image_name
+
+    cover = epub.EpubHtml(title="Cover", file_name="cover.xhtml", lang="en")
+    lead_story = top_stories[0] if top_stories else None
+    secondary_stories = top_stories[1:4] if len(top_stories) > 1 else []
+
+    lead_html = ""
+    if lead_story:
+        lead_image = f"<img src='{lead_story['image_ref']}' alt='{escape(lead_story['title'])}' />" if lead_story.get("image_ref") else ""
+        lead_html = (
+            f"<div class='lead-story'>"
+            f"{lead_image}"
+            f"<div class='kicker'>Lead Story</div>"
+            f"<h2><a href='{escape(lead_story['link'] or '#')}'>{escape(lead_story['title'])}</a></h2>"
+            f"<p>{escape(lead_story.get('summary', ''))}</p>"
+            f"</div>"
+        )
+
+    sidebar_html = "".join(
+        f"<div class='mini-story'><h4><a href='{escape(story['link'] or '#')}'>{escape(story['title'])}</a></h4></div>"
+        for story in secondary_stories
     )
-    cover.content = (
-        "<h1 style='font-size: 2.5em; text-align: center; margin-top: 3em;'>"
-        f"{escape(BOOK_TITLE)}</h1>"
-        f"<p style='text-align: center; font-size: 1.2em;'>{escape(today)}</p>"
-    )
+
+    cover.content = f"""
+    <html xmlns="http://www.w3.org/1999/xhtml">
+      <head>
+        <title>{escape(BOOK_TITLE)}</title>
+        <style>
+          body {{ font-family: Georgia, serif; margin: 0; padding: 0; background: #f3efe7; color: #111; }}
+          .paper {{ padding: 24px; }}
+          .masthead {{ text-align: center; font-size: 2.6em; font-weight: bold; letter-spacing: 0.08em; text-transform: uppercase; padding-bottom: 8px; border-bottom: 3px solid #111; }}
+          .date {{ text-align: center; font-size: 1.0em; text-transform: uppercase; letter-spacing: 0.2em; margin: 8px 0 18px 0; }}
+          .grid {{ display: block; }}
+          .lead-story {{ margin-bottom: 16px; padding: 12px; border: 2px solid #111; background: #fff; }}
+          .lead-story img {{ width: 100%; max-height: 280px; object-fit: cover; display: block; margin-bottom: 10px; }}
+          .kicker {{ font-size: 0.8em; font-weight: bold; text-transform: uppercase; letter-spacing: 0.12em; color: #444; }}
+          .lead-story h2 {{ font-size: 1.8em; line-height: 1.1; margin: 8px 0 10px 0; }}
+          .lead-story p {{ font-size: 1.0em; line-height: 1.5; margin: 0; }}
+          .mini-story {{ padding: 12px; border-top: 1px solid #999; background: #f9f6f1; }}
+          .mini-story h4 {{ margin: 0; font-size: 1.1em; line-height: 1.3; }}
+          a {{ color: #0b1b2f; text-decoration: none; }}
+        </style>
+      </head>
+      <body>
+        <div class='paper'>
+          <div class='masthead'>{escape(BOOK_TITLE)}</div>
+          <div class='date'>{escape(today)}</div>
+          <div class='grid'>
+            {lead_html}
+            {sidebar_html}
+          </div>
+        </div>
+      </body>
+    </html>
+    """
     book.add_item(cover)
 
     toc = [epub.Link("cover.xhtml", "Cover", "cover")]
@@ -121,24 +261,30 @@ def build_book(sections: dict[str, list[dict]]) -> epub.EpubBook:
     for section_title, items in sections.items():
         section_slug = slugify(section_title)
         page = epub.EpubHtml(title=section_title, file_name=f"{section_slug}.xhtml", lang="en")
+        section_html = [
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\">",
+            "<head>",
+            "<title>" + escape(section_title) + "</title>",
+            "<style>",
+            "body { font-family: Georgia, serif; margin: 0; padding: 20px; background: #f8f5ee; color: #111; }",
+            "h1 { font-size: 2.1em; letter-spacing: 0.06em; text-transform: uppercase; border-bottom: 3px solid #111; padding-bottom: 8px; margin-bottom: 16px; }",
+            ".story { background: #fff; border: 1px solid #d6d0c4; padding: 12px; margin-bottom: 16px; }",
+            ".story img { display: block; width: 100%; max-height: 240px; object-fit: cover; margin-bottom: 10px; }",
+            ".story-meta { font-size: 0.72em; font-weight: bold; letter-spacing: 0.1em; text-transform: uppercase; color: #5b5a57; margin-bottom: 6px; }",
+            "h3 { font-size: 1.4em; margin: 0 0 8px 0; line-height: 1.25; }",
+            "p { font-size: 1.0em; line-height: 1.5; margin: 0; }",
+            "a { color: #0b1b2f; text-decoration: none; }",
+            "</style>",
+            "</head>",
+            "<body>",
+            f"<h1>{escape(section_title)}</h1>",
+        ]
 
-        html = [f"<h1>{escape(section_title)}</h1>"]
         for item in items:
-            link = escape(item["link"] or "#")
-            title = escape(item["title"])
-            summary = escape(item["summary"])
-            source = escape(item["source"])
-            article_block = (
-                f"<h2><a href='{link}'>{title}</a></h2>"
-                f"<p><em>{source}</em></p>"
-                f"<p>{summary}</p>"
-            )
-            if item["summary"]:
-                html.append(article_block)
-            else:
-                html.append(f"<h2><a href='{link}'>{title}</a></h2><p><em>{source}</em></p>")
+            section_html.append(render_story_card(item, compact=False))
 
-        page.content = "".join(html)
+        section_html.extend(["</body>", "</html>"])
+        page.content = "".join(section_html)
         book.add_item(page)
         toc.append(epub.Link(f"{section_slug}.xhtml", section_title, section_slug))
         chapters.append(page)
