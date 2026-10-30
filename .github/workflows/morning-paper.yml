@@ -3,8 +3,8 @@ name: Morning Kindle Paper
 on:
   workflow_dispatch:
   schedule:
-    # Start early to give the ebook time to generate and email before the 6:30 AM target.
-    - cron: "30 5 * * *"
+    # GitHub evaluates cron in UTC. For 5:30 AM America/New_York (EDT, UTC-4), use 09:30 UTC.
+    - cron: "30 9 * * *"
       timezone: "America/New_York"
 
 permissions:
